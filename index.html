@@ -3,9 +3,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Karaokê Bar - Votação</title>
+  <title>Karaokê Bar - Votação Online</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
+  <!-- Firebase SDKs (v8) -->
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap');
     body {
@@ -27,7 +30,9 @@
 
   <!-- CONTEÚDO PRINCIPAL -->
   <main class="flex-grow flex flex-col items-center justify-center p-4">
-    <div id="app" class="w-full max-w-md md:max-w-4xl"></div>
+    <div id="app" class="w-full max-w-md md:max-w-4xl">
+      <div class="text-center text-gray-400 py-12">Conectando ao sistema do bar...</div>
+    </div>
   </main>
 
   <footer class="py-4 text-center text-xs text-gray-500 border-t border-gray-800/50">
@@ -35,26 +40,56 @@
   </footer>
 
   <script>
-    // --- ESTADO GLOBAL (Sincronizado via BroadcastChannel e LocalStorage) ---
-    const defaultState = {
+    // --- CONFIGURAÇÃO DO FIREBASE ---
+    // URL padrão pública gratuita para testes (crie seu próprio projeto no console do firebase.google.com se preferir)
+    const firebaseConfig = {
+      databaseURL: "https://karaoke-bar-default-rtdb.firebaseio.com"
+    };
+
+    let db = null;
+    try {
+      if (!firebase.apps.length) {
+        firebase.initializeApp(firebaseConfig);
+      }
+      db = firebase.database();
+    } catch (e) {
+      console.warn("Erro ao iniciar Firebase. Usando armazenamento local.", e);
+    }
+
+    // --- ESTADO GLOBAL ---
+    let state = {
       rodadaAtiva: false,
       cantorAtual: "Aguardando próxima apresentação...",
       musicaAtual: "--",
       tempoRestante: 0,
-      tempoTotal: 60,
       rodadaId: 1,
-      ranking: [] // { rodadaId, cantor, musica, totalVotos, somaNotas, media }
+      ranking: {} // Dicionário agrupado por nome do cantor: { "Nome do Cantor": { cantor, totalVotos, somaNotas, media, musicas: [...] } }
     };
 
-    function getState() {
-      const saved = localStorage.getItem('karaoke_state');
-      return saved ? JSON.parse(saved) : defaultState;
+    const urlParams = new URLSearchParams(window.location.search);
+    const isDJ = urlParams.get('modo') === 'dj';
+    let timerInterval = null;
+
+    // Sincronização em tempo real com o Firebase
+    if (db) {
+      db.ref('karaoke_state').on('value', (snapshot) => {
+        const val = snapshot.val();
+        if (val) {
+          state = val;
+          if (!state.ranking) state.ranking = {};
+          render();
+        }
+      });
     }
 
-    function saveState(state) {
-      localStorage.setItem('karaoke_state', JSON.stringify(state));
-      channel.postMessage({ type: 'STATE_UPDATE', state });
-      render();
+    function saveState(newState) {
+      state = newState;
+      if (db) {
+        db.ref('karaoke_state').set(state);
+      } else {
+        localStorage.setItem('karaoke_state', JSON.stringify(state));
+        render();
+      }
     }
 
     function getVotosLocais() {
@@ -68,50 +103,31 @@
       localStorage.setItem('karaoke_votos', JSON.stringify(votos));
     }
 
-    // Comunicação entre abas/janelas
-    const channel = new BroadcastChannel('karaoke_channel');
-    channel.onmessage = (event) => {
-      if (event.data.type === 'STATE_UPDATE') {
-        render();
-      }
-    };
-
-    // Verificar modo via URL (?modo=dj)
-    const urlParams = new URLSearchParams(window.location.search);
-    const isDJ = urlParams.get('modo') === 'dj';
-
-    let timerInterval = null;
-
     // --- RENDERIZAÇÃO PRINCIPAL ---
     function render() {
       const app = document.getElementById('app');
-      const state = getState();
-
       if (isDJ) {
-        app.innerHTML = renderDJView(state);
+        app.innerHTML = renderDJView();
       } else {
-        app.innerHTML = renderClienteView(state);
+        app.innerHTML = renderClienteView();
       }
     }
 
     // --- INTERFACE DO CLIENTE (MESA) ---
-    function renderClienteView(state) {
+    function renderClienteView() {
       const votos = getVotosLocais();
       const jaVotou = votos[state.rodadaId] !== undefined;
       const notaDada = votos[state.rodadaId];
 
-      // Ordenar ranking do maior para o menor
-      const sortedRanking = [...state.ranking].sort((a, b) => b.media - a.media);
+      const rankingArray = Object.values(state.ranking || {}).sort((a, b) => b.media - a.media);
 
-      // Se a votação NÃO estiver ativa no momento, exibe o PÓDIO e RANKING
       if (!state.rodadaAtiva) {
-        return renderPodioERankingCliente(sortedRanking);
+        return renderPodioERankingCliente(rankingArray);
       }
 
-      // Se já votou nesta rodada ativa
       if (jaVotou) {
         return `
-          <div class="bg-glass rounded-3xl p-8 text-center space-y-6 shadow-2xl border border-green-500/30">
+          <div class="bg-glass rounded-3xl p-8 text-center space-y-6 shadow-2xl border border-green-500/35">
             <div class="inline-block p-4 rounded-full bg-green-500/10 text-green-400">
               <svg class="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
@@ -129,7 +145,6 @@
         `;
       }
 
-      // Votação aberta para o cantor atual
       return `
         <div class="bg-glass rounded-3xl p-6 md:p-8 space-y-6 shadow-2xl border border-pink-500/20 text-center">
           <div class="flex justify-between items-center border-b border-gray-800 pb-4">
@@ -164,9 +179,9 @@
       `;
     }
 
-    // Componente de Pódio e Ranking
+    // Componente de Pódio e Ranking para Clientes
     function renderPodioERankingCliente(ranking) {
-      if (ranking.length === 0) {
+      if (!ranking || ranking.length === 0) {
         return `
           <div class="bg-glass rounded-3xl p-8 text-center space-y-6 shadow-2xl border border-pink-500/20">
             <h1 class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-pink-500 to-purple-400">
@@ -191,13 +206,13 @@
             <h1 class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 via-pink-500 to-purple-400">
               Placar da Noite
             </h1>
-            <p class="text-xs text-gray-400">Classificação dos cantores em tempo real</p>
+            <p class="text-xs text-gray-400">Classificação unificada dos cantores</p>
           </div>
 
           <!-- PÓDIO TOP 3 -->
           <div class="grid grid-cols-3 gap-2 items-end pt-4 pb-2">
             
-            <!-- 2º Lugar (Esquerda) -->
+            <!-- 2º Lugar -->
             <div class="flex flex-col items-center">
               ${segundo ? `
                 <span class="text-xs font-bold text-gray-300 truncate max-w-[90px]">${segundo.cantor}</span>
@@ -208,7 +223,7 @@
               ` : '<div class="h-24"></div>'}
             </div>
 
-            <!-- 1º Lugar (Centro) -->
+            <!-- 1º Lugar -->
             <div class="flex flex-col items-center">
               ${primeiro ? `
                 <div class="text-yellow-400 text-lg mb-1 animate-bounce">👑</div>
@@ -220,7 +235,7 @@
               ` : '<div class="h-32"></div>'}
             </div>
 
-            <!-- 3º Lugar (Direita) -->
+            <!-- 3º Lugar -->
             <div class="flex flex-col items-center">
               ${terceiro ? `
                 <span class="text-xs font-bold text-amber-600 truncate max-w-[90px]">${terceiro.cantor}</span>
@@ -233,7 +248,7 @@
 
           </div>
 
-          <!-- LISTA COMPLETA DOS OUTROS PARTICIPANTES -->
+          <!-- LISTA COMPLETA -->
           ${demais.length > 0 ? `
             <div class="bg-glass rounded-3xl p-4 border border-gray-800 space-y-2">
               <p class="text-xs uppercase tracking-wider text-gray-400 font-bold mb-2">Outras posições</p>
@@ -243,12 +258,11 @@
                     <span class="text-xs font-bold text-gray-500 w-5">#${idx + 4}</span>
                     <div>
                       <p class="text-sm font-semibold text-white">${item.cantor}</p>
-                      <p class="text-[10px] text-gray-400">${item.musica}</p>
+                      <p class="text-[10px] text-gray-400">${item.totalVotos} avaliações totais</p>
                     </div>
                   </div>
                   <div class="text-right">
                     <span class="text-sm font-bold text-yellow-400">${item.media.toFixed(1)} ★</span>
-                    <p class="text-[10px] text-gray-500">${item.totalVotos} voto(s)</p>
                   </div>
                 </div>
               `).join('')}
@@ -259,14 +273,16 @@
     }
 
     // --- PAINEL DO DJ ---
-    function renderDJView(state) {
+    function renderDJView() {
+      const rankingArray = Object.values(state.ranking || {}).sort((a, b) => b.media - a.media);
+
       return `
         <div class="space-y-6">
           <div class="bg-glass rounded-3xl p-6 border border-purple-500/30">
             <div class="flex justify-between items-center mb-6">
               <div>
                 <h1 class="text-2xl font-bold text-purple-400">Painel do DJ / Apresentador</h1>
-                <p class="text-xs text-gray-400">Gerenciamento da noite em tempo real</p>
+                <p class="text-xs text-gray-400">Sincronizado via Nuvem (Firebase)</p>
               </div>
               <div class="flex items-center space-x-2 bg-gray-900 px-3 py-1.5 rounded-xl border border-gray-800">
                 <span class="w-3 h-3 rounded-full ${state.rodadaAtiva ? 'bg-green-500 animate-ping' : 'bg-red-500'}"></span>
@@ -308,26 +324,25 @@
             </div>
           </div>
 
-          <!-- Ranking no Painel do DJ -->
+          <!-- Placar no Painel do DJ -->
           <div class="bg-glass rounded-3xl p-6 border border-gray-800">
             <div class="flex justify-between items-center mb-4">
-              <h2 class="text-lg font-bold text-white">Placar da Noite (DJ)</h2>
+              <h2 class="text-lg font-bold text-white">Placar Acumulado da Noite</h2>
               <button onclick="limparRanking()" class="text-xs text-red-400 hover:underline">Zerar Ranking</button>
             </div>
             <div class="space-y-3">
-              ${state.ranking.length === 0 ? '<p class="text-sm text-gray-500 text-center py-4">Nenhum voto registrado.</p>' : ''}
-              ${[...state.ranking].sort((a,b) => b.media - a.media).map((item, idx) => `
+              ${rankingArray.length === 0 ? '<p class="text-sm text-gray-500 text-center py-4">Nenhum voto registrado.</p>' : ''}
+              ${rankingArray.map((item, idx) => `
                 <div class="flex items-center justify-between p-3 rounded-2xl bg-gray-900/60 border border-gray-800">
                   <div class="flex items-center space-x-3">
                     <span class="w-7 h-7 rounded-full bg-pink-500/20 text-pink-400 font-bold flex items-center justify-center text-xs">#${idx + 1}</span>
                     <div>
                       <p class="font-bold text-white text-sm">${item.cantor}</p>
-                      <p class="text-xs text-gray-400">${item.musica}</p>
+                      <p class="text-xs text-gray-400">${item.totalVotos} votos somados</p>
                     </div>
                   </div>
                   <div class="text-right">
                     <p class="text-lg font-extrabold text-yellow-400">${item.media.toFixed(1)} ★</p>
-                    <p class="text-xs text-gray-500">${item.totalVotos} voto(s)</p>
                   </div>
                 </div>
               `).join('')}
@@ -339,36 +354,34 @@
 
     // --- AÇÕES DO SISTEMA ---
     function votar(nota) {
-      const state = getState();
       if (!state.rodadaAtiva) return;
 
       registrarVotoLocal(state.rodadaId, nota);
 
-      let item = state.ranking.find(r => r.rodadaId === state.rodadaId);
-      if (!item) {
-        item = {
-          rodadaId: state.rodadaId,
-          cantor: state.cantorAtual,
-          musica: state.musicaAtual,
-          totalVotos: 0,
-          somaNotas: 0,
-          media: 0
-        };
-        state.ranking.push(item);
-      }
+      const nomeCantor = state.cantorAtual.trim();
+      if (!state.ranking) state.ranking = {};
 
-      item.totalVotos += 1;
-      item.somaNotas += nota;
-      item.media = item.somaNotas / item.totalVotos;
+      // Se o cantor já cantou antes, acumula os pontos na mesma chave do objeto
+      let cantorObj = state.ranking[nomeCantor] || {
+        cantor: nomeCantor,
+        totalVotos: 0,
+        somaNotas: 0,
+        media: 0
+      };
+
+      cantorObj.totalVotos += 1;
+      cantorObj.somaNotas += nota;
+      cantorObj.media = cantorObj.somaNotas / cantorObj.totalVotos;
+
+      state.ranking[nomeCantor] = cantorObj;
 
       saveState(state);
       confetti({ particleCount: 60, spread: 60, origin: { y: 0.7 } });
     }
 
     function iniciarVotacao() {
-      const state = getState();
-      const cantor = document.getElementById('inputCantor')?.value || "Cantor Sem Nome";
-      const musica = document.getElementById('inputMusica')?.value || "Música Livre";
+      const cantor = document.getElementById('inputCantor')?.value.trim() || "Cantor Sem Nome";
+      const musica = document.getElementById('inputMusica')?.value.trim() || "Música Livre";
 
       state.cantorAtual = cantor;
       state.musicaAtual = musica;
@@ -379,10 +392,9 @@
 
       clearInterval(timerInterval);
       timerInterval = setInterval(() => {
-        const s = getState();
-        if (s.tempoRestante > 0 && s.rodadaAtiva) {
-          s.tempoRestante -= 1;
-          saveState(s);
+        if (state.tempoRestante > 0 && state.rodadaAtiva) {
+          state.tempoRestante -= 1;
+          saveState(state);
         } else {
           pausarVotacao();
         }
@@ -391,14 +403,12 @@
 
     function pausarVotacao() {
       clearInterval(timerInterval);
-      const state = getState();
       state.rodadaAtiva = false;
       saveState(state);
     }
 
     function proximaRodada() {
       pausarVotacao();
-      const state = getState();
       state.rodadaId += 1;
       state.cantorAtual = "Aguardando próxima apresentação...";
       state.musicaAtual = "--";
@@ -407,9 +417,8 @@
     }
 
     function limparRanking() {
-      if (confirm("Deseja apagar o ranking da noite?")) {
-        const state = getState();
-        state.ranking = [];
+      if (confirm("Deseja apagar o ranking acumulado da noite?")) {
+        state.ranking = {};
         saveState(state);
       }
     }
